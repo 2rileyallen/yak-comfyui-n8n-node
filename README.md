@@ -39,3 +39,13 @@ cd yak-comfyui-n8n-node
 
 # Run the Windows setup
 setup_windows.bat
+
+## Gatekeeper service
+
+This project includes a crucial middleware component called the “Gatekeeper” (`gatekeeper.py`). It runs alongside ComfyUI and is responsible for:
+
+* Receiving job requests from the n8n node
+* Managing the ComfyUI queue to prevent conflicts
+* Monitoring job progress via WebSockets
+* Storing job history in a local SQLite database
+* Handling callbacks to n8n when a job is complete
