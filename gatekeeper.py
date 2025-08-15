@@ -1,16 +1,18 @@
-# gatekeeper.py
-# Phase 2 - The Middleware Service
+# Phase 2 - The Middleware Service (with Output Formatting)
 
 import asyncio
 import json
 import uuid
 import websockets
-import httpx # Re-enabled httpx for async requests
+import httpx
 import random
+import os
+import base64
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from pathlib import Path
 
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, Request, HTTPException, Depends, WebSocket, WebSocketDisconnect
 from sqlalchemy import create_engine, Column, String, Text, DateTime
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from sqlalchemy.sql import func
@@ -21,8 +23,12 @@ DB_FILE = "gatekeeper_db.sqlite"
 COMFYUI_ADDRESS = "127.0.0.1:8188"
 GATEKEEPER_PORT = 8189
 CLIENT_ID = str(uuid.uuid4())
-JOB_HISTORY_DAYS = 30 # Delete any job older than this
-COMPLETED_JOB_HISTORY_DAYS = 7 # Delete completed jobs older than this
+JOB_HISTORY_DAYS = 30
+COMPLETED_JOB_HISTORY_DAYS = 7
+
+# --- State Tracking ---
+last_queue_remaining = None
+last_prompt_id = None
 
 # --- Database Setup (SQLAlchemy) ---
 Base = declarative_base()
@@ -37,66 +43,64 @@ class Job(Base):
     status = Column(String, default="pending")
     callback_type = Column(String)
     callback_url = Column(String, nullable=True)
+    output_format = Column(String, default="binary")
     result_data = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 Base.metadata.create_all(bind=engine)
 
+# --- WebSocket Connection Manager ---
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: dict[str, WebSocket] = {}
+
+    async def connect(self, job_id: str, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections[job_id] = websocket
+        print(f"[WS-CONN] WebSocket connected for job_id: {job_id}")
+
+    def disconnect(self, job_id: str):
+        if job_id in self.active_connections:
+            del self.active_connections[job_id]
+            print(f"[WS-DCONN] WebSocket disconnected for job_id: {job_id}")
+
+    async def send_result(self, job_id: str, data: dict):
+        if job_id in self.active_connections:
+            websocket = self.active_connections[job_id]
+            try:
+                print(f"[WS-SEND] Sending result to job {job_id}: {data}")
+                await websocket.send_json(data)
+            except Exception as e:
+                print(f"[ERROR] Failed to send WebSocket message for job {job_id}: {e}")
+
+manager = ConnectionManager()
+
 # --- DB Cleanup Function ---
 def cleanup_old_jobs():
-    """Deletes old job records from the database on startup."""
     db = SessionLocal()
     try:
-        # Delete completed jobs older than COMPLETED_JOB_HISTORY_DAYS
         completed_cutoff = datetime.now() - timedelta(days=COMPLETED_JOB_HISTORY_DAYS)
-        num_deleted_completed = db.query(Job).filter(
-            Job.status == 'completed',
-            Job.created_at < completed_cutoff
-        ).delete(synchronize_session=False)
-
-        # Delete ANY job older than JOB_HISTORY_DAYS
+        db.query(Job).filter(Job.status == 'completed', Job.created_at < completed_cutoff).delete()
         all_cutoff = datetime.now() - timedelta(days=JOB_HISTORY_DAYS)
-        num_deleted_all = db.query(Job).filter(
-            Job.created_at < all_cutoff
-        ).delete(synchronize_session=False)
-
+        db.query(Job).filter(Job.created_at < all_cutoff).delete()
         db.commit()
-        if num_deleted_completed > 0:
-            print(f"[DB Cleanup] Deleted {num_deleted_completed} completed jobs older than {COMPLETED_JOB_HISTORY_DAYS} days.")
-        if num_deleted_all > 0:
-            print(f"[DB Cleanup] Deleted {num_deleted_all} jobs older than {JOB_HISTORY_DAYS} days.")
-    except Exception as e:
-        print(f"[ERROR] Database cleanup failed: {e}")
-        db.rollback()
+        print("[INFO] Old jobs cleaned up.")
     finally:
         db.close()
 
 # --- Lifespan Event Handler ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print(f"[INFO] Gatekeeper starting up with Client ID: {CLIENT_ID}")
-    
-    # Run cleanup and crash recovery on startup
+    print(f"[INFO] Gatekeeper starting up.")
     cleanup_old_jobs()
-    # TODO: Add crash recovery logic here.
-    
-    # Re-enable the WebSocket listener
     task = asyncio.create_task(listen_to_comfyui())
-    print("[INFO] ComfyUI WebSocket listener started in the background.")
-    
     yield
-    
     print("[INFO] Gatekeeper server shutting down.")
     task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        print("[INFO] WebSocket listener task cancelled successfully.")
 
 # --- FastAPI Application ---
 app = FastAPI(title="Yak ComfyUI Gatekeeper", lifespan=lifespan)
 
-# --- Helper function to get a database session ---
 def get_db():
     db = SessionLocal()
     try:
@@ -104,126 +108,224 @@ def get_db():
     finally:
         db.close()
 
-# --- Helper function to randomize seed ---
 def randomize_seed(workflow):
-    """Finds all KSampler nodes and gives them a random seed."""
     for node in workflow.values():
         if node.get("class_type") == "KSampler":
-            node["inputs"]["seed"] = random.randint(0, 999999999999999)
-            print(f"[INFO] Randomized seed to {node['inputs']['seed']}")
+            node["inputs"]["seed"] = random.randint(0, 9999)
     return workflow
 
 # --- API Endpoints ---
 @app.post("/execute")
 async def execute_workflow(request: Request, db: Session = Depends(get_db)):
-    print("[INFO] Received new job request from n8n.")
-    
-    try:
-        payload = await request.json()
-        if not all(k in payload for k in ['n8n_execution_id', 'callback_type', 'workflow_json']):
-            raise HTTPException(status_code=400, detail="Missing required fields.")
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON.")
-
+    payload = await request.json()
     new_job = Job(
         job_id=str(uuid.uuid4()),
         n8n_execution_id=payload['n8n_execution_id'],
         callback_type=payload['callback_type'],
         callback_url=payload.get('callback_url'),
+        output_format=payload.get('output_format', 'binary'),
         status="pending_submission"
     )
     db.add(new_job)
     db.commit()
-    db.refresh(new_job)
-    print(f"[INFO] Job {new_job.job_id} saved to database.")
 
     try:
-        # Randomize the seed before submitting
         randomized_workflow = randomize_seed(payload['workflow_json'])
-        comfy_payload = { "prompt": randomized_workflow }
-        
+        comfy_payload = {"prompt": randomized_workflow}
         async with httpx.AsyncClient() as client:
             response = await client.post(f"http://{COMFYUI_ADDRESS}/prompt", json=comfy_payload)
-            response.raise_for_status() 
-        
-        comfy_response = response.json()
-        if 'prompt_id' not in comfy_response:
-            raise ValueError("ComfyUI API response did not include a prompt_id.")
+            response.raise_for_status()
+            comfy_response = response.json()
 
         new_job.comfy_prompt_id = comfy_response['prompt_id']
         new_job.status = "queued"
         db.commit()
+        db.refresh(new_job)
         print(f"[INFO] Job {new_job.job_id} submitted to ComfyUI. Prompt ID: {new_job.comfy_prompt_id}")
-
-    except (httpx.RequestError, ValueError) as e:
-        print(f"[ERROR] Failed to submit job to ComfyUI: {e}")
+        return {"status": "success", "job_id": new_job.job_id}
+    except Exception as e:
         new_job.status = "submission_failed"
         db.commit()
         raise HTTPException(status_code=500, detail=f"Failed to communicate with ComfyUI: {e}")
 
-    return {"status": "success", "message": "Job submitted to ComfyUI.", "job_id": new_job.job_id}
-
-
-@app.get("/status/{job_id}")
-async def get_job_status(job_id: str, db: Session = Depends(get_db)):
-    job = db.query(Job).filter(Job.job_id == job_id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found.")
-    return {"job_id": job.job_id, "status": job.status, "result": job.result_data}
-
+@app.websocket("/ws/{job_id}")
+async def websocket_endpoint(websocket: WebSocket, job_id: str):
+    await manager.connect(job_id, websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(job_id)
 
 # --- ComfyUI WebSocket Listener ---
 async def listen_to_comfyui():
+    global last_queue_remaining, last_prompt_id
     ws_url = f"ws://{COMFYUI_ADDRESS}/ws"
     
     while True:
         try:
             async with websockets.connect(ws_url) as websocket:
-                print(f"[INFO] WebSocket connection to ComfyUI established at {ws_url}")
+                print(f"[INFO] WebSocket connection to ComfyUI established.")
                 async for message in websocket:
                     try:
                         data = json.loads(message)
-                        if not isinstance(data, dict): continue
+                        print(f"[WS-RECV] {data}")
+                        
+                        if not isinstance(data, dict):
+                            continue
 
-                        if data.get('type') == 'executing' and 'prompt_id' in data.get('data', {}):
-                            prompt_id = data['data']['prompt_id']
-                            print(f"[INFO] Job with prompt_id {prompt_id} is now executing.")
-                            db = SessionLocal()
-                            try:
-                                job = db.query(Job).filter(Job.comfy_prompt_id == prompt_id).first()
-                                if job and job.status != 'running':
-                                    job.status = "running"
-                                    db.commit()
-                                    print(f"[DB] Updated job {job.job_id} to running.")
-                            finally:
-                                db.close()
-
-                        elif data.get('type') == 'executed' and 'prompt_id' in data.get('data', {}):
-                            prompt_id = data['data']['prompt_id']
-                            output_data = data['data'].get('output', {})
-                            print(f"[SUCCESS] Job with prompt_id {prompt_id} has finished.")
+                        # Handle status messages - track queue remaining
+                        if data.get('type') == 'status':
+                            status_data = data.get('data', {}).get('status', {})
+                            exec_info = status_data.get('exec_info', {})
+                            current_queue = exec_info.get('queue_remaining')
                             
-                            db = SessionLocal()
-                            try:
-                                job = db.query(Job).filter(Job.comfy_prompt_id == prompt_id).first()
-                                if job:
-                                    job.status = "completed"
-                                    job.result_data = json.dumps(output_data)
-                                    db.commit()
-                                    print(f"[DB] Updated job {job.job_id} to completed and saved output.")
-                                    # TODO: Trigger the actual callback (webhook or websocket)
-                            finally:
-                                db.close()
+                            if current_queue is not None:
+                                print(f"[QUEUE] Current: {current_queue}, Last: {last_queue_remaining}")
+                                
+                                # Check if queue decreased (job completed)
+                                if last_queue_remaining is not None and current_queue < last_queue_remaining and last_prompt_id:
+                                    print(f"[COMPLETED] Job finished! Queue went from {last_queue_remaining} to {current_queue}")
+                                    await handle_job_completion(last_prompt_id)
+                                
+                                last_queue_remaining = current_queue
+
+                        # Handle progress_state messages - track prompt_id
+                        elif data.get('type') == 'progress_state':
+                            progress_data = data.get('data', {})
+                            prompt_id = progress_data.get('prompt_id')
+                            if prompt_id:
+                                last_prompt_id = prompt_id
+                                print(f"[PROMPT-ID] Updated to: {prompt_id}")
 
                     except Exception as e:
                         print(f"[ERROR] Error processing WebSocket message: {e}")
-
         except Exception as e:
-            print(f"[ERROR] An unexpected error occurred in the WebSocket listener: {e}. Reconnecting in 5 seconds...")
+            print(f"[ERROR] WebSocket listener error: {e}. Reconnecting in 5s...")
             await asyncio.sleep(5)
 
+async def handle_job_completion(prompt_id: str):
+    """Handle job completion using the prompt_id"""
+    db = SessionLocal()
+    try:
+        # Find the job by prompt_id
+        job = db.query(Job).filter(Job.comfy_prompt_id == prompt_id).first()
+        if not job or job.status == 'completed':
+            print(f"[SKIP] Job not found or already completed for prompt_id: {prompt_id}")
+            return
+
+        # Get history data from ComfyUI
+        async with httpx.AsyncClient() as client:
+            history_response = await client.get(f"http://{COMFYUI_ADDRESS}/history/{prompt_id}")
+            history_response.raise_for_status()
+            history_data = history_response.json()
+
+        if prompt_id not in history_data:
+            print(f"[ERROR] No history found for prompt_id: {prompt_id}")
+            return
+
+        output_data = history_data[prompt_id].get('outputs', {})
+        
+        # Update job status
+        job.status = "completed"
+        job.result_data = json.dumps(output_data)
+        db.commit()
+        print(f"[DB] Job {job.job_id} marked as completed.")
+
+        # Format the output
+        final_payload = await format_output(job, output_data)
+
+        # Send result
+        if job.callback_type == 'websocket':
+            await manager.send_result(job.job_id, final_payload)
+            print(f"[WS-PUSH] Pushed result for job {job.job_id}.")
+        elif job.callback_type == 'webhook' and job.callback_url:
+            print(f"[WEBHOOK] Sending result for job {job.job_id} to {job.callback_url}")
+            async with httpx.AsyncClient() as client:
+                await client.post(job.callback_url, json=final_payload)
+
+    except Exception as e:
+        print(f"[ERROR] Error handling job completion for {prompt_id}: {e}")
+    finally:
+        db.close()
+
+# --- Output Formatting Logic ---
+async def format_output(job: Job, output_data: dict) -> dict:
+    """Prepares the final payload based on the job's requested output format."""
+
+    # For text format, return the history data
+    if job.output_format == 'text':
+        return {"format": "text", "data": json.dumps(output_data)}
+
+    # Find all output files
+    files = []
+    for node_output in output_data.values():
+        if 'images' in node_output:
+            files.extend([{'filename': img['filename'], 'type': 'image'} for img in node_output['images']])
+        if 'videos' in node_output:
+            files.extend([{'filename': vid['filename'], 'type': 'video'} for vid in node_output['videos']])
+        if 'audio' in node_output:
+            files.extend([{'filename': aud['filename'], 'type': 'audio'} for aud in node_output['audio']])
+
+    if not files:
+        return {"format": "text", "data": json.dumps(output_data)}
+
+    results = []
+    for file_info in files:
+        filename = file_info['filename']
+        file_type = file_info['type']
+
+        if job.output_format == 'filePath':
+            # Construct real filesystem path
+            gatekeeper_dir = Path(__file__).parent.absolute()
+            file_path = gatekeeper_dir / "ComfyUI" / "output" / filename
+            
+            results.append({
+                "format": "filePath",
+                "type": file_type,
+                "data": str(file_path),
+                "filename": filename
+            })
+        elif job.output_format == 'binary':
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(f"http://{COMFYUI_ADDRESS}/view?filename={filename}")
+                    response.raise_for_status()
+                    binary_data = response.content
+                    base64_data = base64.b64encode(binary_data).decode('utf-8')
+
+                    # Determine MIME type
+                    ext = filename.lower().split('.')[-1]
+                    mime_type = "application/octet-stream"
+                    if ext in ['png', 'jpg', 'jpeg', 'gif', 'webp']:
+                        mime_type = f"image/{ext if ext != 'jpg' else 'jpeg'}"
+                    elif ext in ['mp4', 'avi', 'mov', 'webm']:
+                        mime_type = f"video/{ext}"
+                    elif ext in ['mp3', 'wav', 'ogg', 'flac']:
+                        mime_type = f"audio/{ext}"
+
+                    results.append({
+                        "format": "binary",
+                        "type": file_type,
+                        "data": base64_data,
+                        "filename": filename,
+                        "mime_type": mime_type
+                    })
+            except Exception as e:
+                print(f"[ERROR] Failed to fetch binary data for {filename}: {e}")
+                # Fallback to filePath
+                gatekeeper_dir = Path(__file__).parent.absolute()
+                file_path = gatekeeper_dir / "ComfyUI" / "output" / filename
+                results.append({
+                    "format": "filePath",
+                    "type": file_type,
+                    "data": str(file_path),
+                    "filename": filename,
+                    "error": str(e)
+                })
+
+    return results[0] if len(results) == 1 else {"format": "multiple", "results": results}
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    print(f"[INFO] Starting Gatekeeper server on port {GATEKEEPER_PORT}")
     uvicorn.run("gatekeeper:app", host="0.0.0.0", port=GATEKEEPER_PORT, reload=True)

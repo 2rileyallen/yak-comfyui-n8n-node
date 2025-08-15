@@ -1,0 +1,17 @@
+{
+  "custom_nodes": [],
+  "models": [
+    {
+      "name": "sd_xl_base_1.0.safetensors",
+      "type": "checkpoint", 
+      "install_path": "models/checkpoints/",
+      "description": "Stable Diffusion XL base model",
+      "google_download_url": "https://drive.google.com/uc?export=download&id=1vJlX6m6zLfj2Vb0_OfSn9s2ZA6oBx9vT",
+      "required": true
+    }
+  ],
+  "system_requirements": {
+    "min_vram_gb": 8,
+    "recommended_vram_gb": 12
+  }
+}

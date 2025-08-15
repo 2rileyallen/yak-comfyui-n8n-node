@@ -1,0 +1,35 @@
+{
+  "properties": [
+    {
+      "displayName": "Positive Prompt",
+      "name": "positivePrompt",
+      "type": "string",
+      "default": "a beautiful photograph of a landscape",
+      "placeholder": "Enter positive prompt...",
+      "description": "The main subject and style of the image you want to generate.",
+      "required": true
+    },
+    {
+      "displayName": "Negative Prompt",
+      "name": "negativePrompt",
+      "type": "string",
+      "default": "text, watermark, ugly",
+      "placeholder": "Enter negative prompt...",
+      "description": "Things you want to avoid in the image."
+    }
+  ],
+  "mappings": {
+    "positivePrompt": {
+      "nodeId": "6",
+      "path": "inputs.text"
+    },
+    "negativePrompt": {
+      "nodeId": "7", 
+      "path": "inputs.text"
+    },
+    "batchSize": {
+      "nodeId": "5",
+      "path": "inputs.batch_size"
+    }
+  }
+}

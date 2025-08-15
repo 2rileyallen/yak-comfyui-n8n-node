@@ -8,3 +8,5 @@ yarn.lock
 .vscode/launch.json
 ComfyUI/
 gatekeeper_db.sqlite
+dist/
+package-lock.json
